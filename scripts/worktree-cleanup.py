@@ -6,6 +6,7 @@ Usage: python3 scripts/worktree-cleanup.py [--apply] [--install]
 """
 
 import argparse
+import codecs
 import fcntl
 import json
 import os
@@ -14,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlencode
@@ -50,7 +52,25 @@ def command(arguments, cwd=None):
 
 
 def git(repository, *arguments):
-    return command(["git", "--no-optional-locks", "-C", str(repository), *arguments])
+    return command(["git", "--no-pager", "--no-optional-locks", "-c", "core.fsmonitor=false", "-C", str(repository), *arguments])
+
+
+def normalize_path_for_comparison(path):
+    return Path(unicodedata.normalize("NFD", str(path)).casefold())
+
+
+def has_repository_git_filters(repository):
+    output = git(repository, "config", "--null", "--show-scope", "--name-only", "--list")
+    if not output.endswith(b"\0"):
+        raise Blocked("invalid-git-configuration")
+    fields = output[:-1].split(b"\0")
+    if len(fields) % 2:
+        raise Blocked("invalid-git-configuration")
+    return any(
+        scope in {b"local", b"worktree"} and key.lower().startswith(b"filter.")
+        and key.lower().endswith((b".clean", b".process"))
+        for scope, key in zip(fields[::2], fields[1::2])
+    )
 
 
 def report(status, **fields):
@@ -116,7 +136,9 @@ def open_process_paths():
         if field.startswith(b"p"):
             process_id = int(field[1:])
         elif field.startswith(b"n/") and process_id != os.getpid():
-            paths.add(Path(os.fsdecode(field[1:])))
+            # 日本語や改行が別の表記で出力されても、使用中のファイルを見落とさないようにする。
+            raw_path = codecs.escape_decode(field[1:])[0]
+            paths.add(Path(os.fsdecode(raw_path)).resolve())
     return paths
 
 
@@ -126,10 +148,11 @@ def local_block_reason(repository, worktree, process_paths):
         return "locked-or-prunable"
     if not path.is_dir() or path.is_symlink():
         return "missing-or-symlink"
+    comparison_path = normalize_path_for_comparison(path.resolve())
     branch = worktree["branch"]
     if not branch.startswith("refs/heads/") or branch.removeprefix("refs/heads/") in SHARED_BRANCHES:
         return "detached-or-shared-branch"
-    if any(open_path.is_relative_to(path) for open_path in process_paths):
+    if any(normalize_path_for_comparison(open_path).is_relative_to(comparison_path) for open_path in process_paths):
         return "in-use"
     if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", worktree["head"]):
         return "invalid-head"
@@ -137,15 +160,21 @@ def local_block_reason(repository, worktree, process_paths):
         operation_path = os.fsdecode(git(path, "rev-parse", "--path-format=absolute", "--git-path", operation)).strip()
         if Path(operation_path).exists():
             return "git-operation-in-progress"
+    # 変更の確認を省く設定があると、編集済みファイルも変更なしと判定される。
+    indexed_files = git(path, "ls-files", "-v", "-z").split(b"\0")
+    if any(entry.startswith(b"S ") or entry[:1].islower() for entry in indexed_files):
+        return "assumed-or-skipped-files"
+    if any(
+        entry.startswith(b"160000 ") for entry in git(path, "ls-files", "--stage", "-z").split(b"\0")
+    ):
+        return "submodule"
+    if has_repository_git_filters(path):
+        return "repository-git-filters"
     if git(path, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=none"):
         return "uncommitted-or-untracked"
     ignored = git(path, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z")
     if any("node_modules" not in Path(os.fsdecode(name)).parts for name in ignored.split(b"\0") if name):
         return "ignored-files"
-    if any(
-        entry.startswith(b"160000 ") for entry in git(path, "ls-files", "--stage", "-z").split(b"\0")
-    ):
-        return "submodule"
     if git(path, "rev-parse", "HEAD").decode().strip() != worktree["head"]:
         return "head-changed"
     return None
@@ -231,6 +260,8 @@ def process_repository(found_path, accounts, apply, process_paths):
                 continue
             git(repository, "worktree", "remove", "--", path)
             report("removed", path=path, head=worktree["head"], pr=pull_request)
+        except (OSError, RuntimeError):
+            report("blocked", path=path, reason="filesystem-unreadable")
         except (Blocked, ValueError, KeyError, TypeError) as error:
             report("blocked", path=path, reason=str(error) if isinstance(error, Blocked) else "invalid-response")
 
@@ -239,13 +270,18 @@ def install_launch_agent(config_path, apply):
     target = Path.home() / "Library/LaunchAgents" / f"{LABEL}.plist"
     if target.exists() or target.is_symlink():
         raise Blocked("launch-agent-already-exists")
+    path_directories = []
+    for tool in ("git", "direnv", "gh", "lsof"):
+        executable = shutil.which(tool)
+        if executable is None:
+            raise Blocked("missing-required-tool:" + tool)
+        path_directories.append(str(Path(executable).absolute().parent))
     log_directory = Path.home() / "Library/Logs/worktree-cleanup"
     log_directory.mkdir(parents=True, exist_ok=True)
     target.parent.mkdir(parents=True, exist_ok=True)
     arguments = [sys.executable, str(Path(__file__).resolve()), "--config", str(config_path)]
     if apply:
         arguments.append("--apply")
-    path_directories = [str(Path(shutil.which(tool) or tool).parent) for tool in ("git", "direnv", "gh", "lsof")]
     agent = {
         "Label": LABEL, "ProgramArguments": arguments,
         "StartCalendarInterval": {"Hour": DAILY_RUN_HOUR, "Minute": DAILY_RUN_MINUTE},
@@ -285,17 +321,19 @@ def main():
                 report("skipped", reason="already-running")
                 return 0
             report("started", mode="apply" if args.apply else "dry-run")
+            # 利用中のファイルを確認できない場合は、削除を進めない。
             process_paths = open_process_paths()
-            repositories = 0
-            for repository in discover_repositories(roots):
-                repositories += 1
+            repositories = list(discover_repositories(roots))
+            for repository in repositories:
                 try:
                     process_repository(repository, accounts, args.apply, process_paths)
+                except (OSError, RuntimeError):
+                    report("blocked", path=str(repository), reason="filesystem-unreadable")
                 except (Blocked, ValueError, KeyError, TypeError):
                     report("blocked", path=str(repository), reason="repository-unreadable")
-            report("finished", repositories=repositories)
+            report("finished", repositories=len(repositories))
         return 0
-    except (Blocked, OSError, ValueError, KeyError, TypeError) as error:
+    except (Blocked, OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
         report("error", reason=str(error) if isinstance(error, Blocked) else "config-or-runtime-error")
         return 1
 

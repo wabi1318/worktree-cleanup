@@ -2,8 +2,11 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
+import plistlib
 import subprocess
 import tempfile
+import unicodedata
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -25,9 +28,9 @@ class WorktreeCleanupTest(unittest.TestCase):
         self.repository.mkdir()
         self.git("init", "--quiet", "-b", "main")
         (self.repository / "README.md").write_text("fixture\n")
-        (self.repository / ".gitignore").write_text("node_modules/\n.env.local\n")
+        (self.repository / ".gitignore").write_text("node_modules/\n.env\n")
         self.git("add", "README.md", ".gitignore")
-        self.git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "fixture")
+        self.git("-c", "user.name=Fixture", "-c", "user.email=fixture", "commit", "--quiet", "-m", "fixture")
         self.git("worktree", "add", "--quiet", "-b", "feature/cleanup", str(self.worktree))
         self.entry = cleanup.list_worktrees(self.repository)[1]
 
@@ -71,10 +74,10 @@ class WorktreeCleanupTest(unittest.TestCase):
         self.assertEqual(self.reason(), "uncommitted-or-untracked")
 
     def test_ignored_secret_is_kept_without_reading_contents(self):
-        (self.worktree / ".env.local").write_text("fixture-secret\n")
+        (self.worktree / ".env").write_text("fixture-secret\n")
         self.assertEqual(self.reason(), "ignored-files")
         self.assertEqual(self.process(apply=True)[0]["reason"], "ignored-files")
-        self.assertTrue((self.worktree / ".env.local").exists())
+        self.assertTrue((self.worktree / ".env").exists())
 
     def test_dependency_directory_can_be_removed(self):
         (self.worktree / "node_modules").mkdir()
@@ -86,6 +89,99 @@ class WorktreeCleanupTest(unittest.TestCase):
         self.assertEqual(self.reason({self.worktree}), "in-use")
         self.assertEqual(self.reason({self.worktree / "README.md"}), "in-use")
         self.assertIsNone(self.reason({Path(str(self.worktree) + "-other/README.md")}))
+
+    def test_symlinked_parent_does_not_hide_an_open_worktree(self):
+        storage = self.root / "storage"
+        storage.mkdir()
+        self.git("worktree", "move", str(self.worktree), str(storage / "worktree"))
+        moved_storage = self.root / "moved-storage"
+        storage.rename(moved_storage)
+        storage.symlink_to(moved_storage, target_is_directory=True)
+        self.entry = cleanup.list_worktrees(self.repository)[1]
+        self.assertEqual(self.reason({moved_storage / "worktree/README.md"}), "in-use")
+
+    def test_process_path_alias_does_not_hide_an_open_file(self):
+        alias = self.root / "alias"
+        alias.symlink_to(self.worktree, target_is_directory=True)
+        output = f"p0\0n{alias / 'README.md'}\0".encode()
+        with patch.object(cleanup, "command", return_value=output):
+            process_paths = cleanup.open_process_paths()
+        self.assertEqual(self.reason(process_paths), "in-use")
+
+    def test_process_paths_decode_escaped_filenames(self):
+        names = (
+            ("日本語の作業", rb"\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe3\x81\xae\xe4\xbd\x9c\xe6\xa5\xad"),
+            (r"path\x41", rb"path\\x41"),
+        )
+        for name, encoded_name in names:
+            with self.subTest(name=name):
+                directory = self.root / name
+                directory.mkdir()
+                output = b"p0\0n" + os.fsencode(self.root) + b"/" + encoded_name + b"\0"
+                with patch.object(cleanup, "command", return_value=output):
+                    process_paths = cleanup.open_process_paths()
+                self.assertEqual(process_paths, {directory})
+
+    def test_case_variant_process_path_protects_worktree(self):
+        process_path = Path(str(self.worktree / "README.md").swapcase())
+        self.assertEqual(self.reason({process_path}), "in-use")
+
+    def test_unicode_variant_process_path_protects_worktree(self):
+        self.worktree = self.root / "が"
+        self.git("worktree", "move", str(self.entry["path"]), str(self.worktree))
+        self.entry = cleanup.list_worktrees(self.repository)[1]
+        process_path = Path(unicodedata.normalize("NFD", str(self.worktree / "README.md")))
+        self.assertEqual(self.reason({process_path}), "in-use")
+
+    def test_repository_fsmonitor_does_not_run(self):
+        marker = self.root / "monitor-called"
+        monitor = self.root / "monitor"
+        monitor.write_text("#!" + cleanup.sys.executable + "\nfrom pathlib import Path\nPath(" + repr(str(marker)) + ").write_text('called')\n")
+        monitor.chmod(0o700)
+        self.git("config", "core.fsmonitor", str(monitor))
+        cleanup.git(self.worktree, "status", "--porcelain")
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.git("config", "--get", "core.fsmonitor").decode().strip(), str(monitor))
+
+    def test_repository_filter_keeps_worktree_without_running(self):
+        attributes = self.worktree / ".gitattributes"
+        attributes.write_text("README.md filter=probe\n")
+        cleanup.git(self.worktree, "add", ".gitattributes")
+        marker = self.root / "filter-called"
+        program = self.root / "clean-filter"
+        program.write_text("#!" + cleanup.sys.executable + "\nimport sys\nfrom pathlib import Path\nPath(" + repr(str(marker)) + ").write_text('called')\nsys.stdout.buffer.write(sys.stdin.buffer.read())\n")
+        program.chmod(0o700)
+        self.git("config", "filter.probe.clean", str(program))
+        (self.worktree / "README.md").write_text("changed\n")
+        self.assertEqual(self.reason(), "repository-git-filters")
+        self.assertFalse(marker.exists())
+
+    def test_global_filter_definition_does_not_block_worktree(self):
+        config = self.root / "global.gitconfig"
+        config.write_text('[filter "fixture"]\n\tclean = cat\n')
+        with patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(config), "GIT_CONFIG_NOSYSTEM": "1"}):
+            self.assertIsNone(self.reason())
+
+    def test_submodule_is_kept_before_status_inspection(self):
+        cleanup.git(self.worktree, "update-index", "--add", "--cacheinfo", "160000," + self.entry["head"] + ",external")
+        original = cleanup.git
+        def inspect(repository, *arguments):
+            if arguments[0] == "status":
+                raise AssertionError("Submodule status must not run")
+            return original(repository, *arguments)
+        with patch.object(cleanup, "git", side_effect=inspect):
+            self.assertEqual(self.reason(), "submodule")
+
+    def test_files_with_skipped_change_detection_are_kept(self):
+        for flag, reset_flag in (("--assume-unchanged", "--no-assume-unchanged"), ("--skip-worktree", "--no-skip-worktree")):
+            with self.subTest(flag=flag):
+                cleanup.git(self.worktree, "update-index", flag, "README.md")
+                (self.worktree / "README.md").write_text("modified fixture\n")
+                try:
+                    self.assertEqual(self.reason(), "assumed-or-skipped-files")
+                finally:
+                    (self.worktree / "README.md").write_text("fixture\n")
+                    cleanup.git(self.worktree, "update-index", reset_flag, "README.md")
 
     def test_locked_worktree_is_kept(self):
         self.git("worktree", "lock", str(self.worktree))
@@ -107,8 +203,58 @@ class WorktreeCleanupTest(unittest.TestCase):
             cleanup.process_repository(self.repository, [(self.root, "fixture")], True, set())
         self.assertTrue(self.worktree.exists())
 
+    @unittest.skipIf(os.geteuid() == 0, "requires filesystem permission checks")
+    def test_unreadable_worktree_does_not_stop_other_worktrees(self):
+        storage = self.root / "a-unreadable"
+        storage.mkdir()
+        self.git("worktree", "move", str(self.worktree), str(storage / "worktree"))
+        available = self.root / "z-available"
+        self.git("worktree", "add", "--quiet", "-b", "feature/available", str(available))
+        previous_mode = storage.stat().st_mode & 0o777
+        storage.chmod(0)
+        try:
+            rows = self.process()
+        finally:
+            storage.chmod(previous_mode)
+        candidates = [row["path"] for row in rows if row["status"] == "candidate"]
+        self.assertEqual(candidates, [str(available)])
+
+    def test_worktree_inspection_error_does_not_stop_other_worktrees(self):
+        self.git("worktree", "add", "--quiet", "-b", "feature/another", str(self.root / "another-worktree"))
+        with patch.object(cleanup, "local_block_reason", side_effect=[PermissionError("inspection denied"), None]):
+            rows = self.process()
+        self.assertEqual([row["status"] for row in rows], ["blocked", "candidate"])
+        self.assertEqual(rows[0]["reason"], "filesystem-unreadable")
+
+    def test_process_path_resolution_failure_stops_before_repository_scan(self):
+        config = self.root / "config.json"
+        config.write_text(json.dumps({"scan_roots": [str(self.root)], "accounts": [{"path": str(self.root), "login": "fixture"}]}))
+        output = io.StringIO()
+        with patch.object(cleanup.sys, "argv", [str(SCRIPT), "--config", str(config)]), patch.object(cleanup.Path, "home", return_value=self.root), patch.object(cleanup, "open_process_paths", side_effect=RuntimeError("path resolution failed")), patch.object(cleanup, "discover_repositories") as discover, contextlib.redirect_stdout(output):
+            result = cleanup.main()
+        self.assertEqual(result, 1)
+        self.assertEqual(json.loads(output.getvalue().splitlines()[-1])["status"], "error")
+        discover.assert_not_called()
+
     def test_discovery_deduplicates_worktrees(self):
         self.assertEqual(len(list(cleanup.discover_repositories([self.root]))), 1)
+
+    def test_removal_after_discovery_does_not_report_false_walk_errors(self):
+        config = self.root / "config.json"
+        config.write_text(json.dumps({"scan_roots": [str(self.root)], "accounts": [{"path": str(self.root), "login": "fixture"}]}))
+        original_walk = os.walk
+        def ordered_walk(*arguments, **options):
+            for directory, directories, files in original_walk(*arguments, **options):
+                directories.sort()
+                yield directory, directories, files
+        def remove_fixture(*arguments):
+            self.git("worktree", "remove", str(self.worktree))
+        output = io.StringIO()
+        with patch.object(cleanup.sys, "argv", [str(SCRIPT), "--config", str(config), "--apply"]), patch.object(cleanup.Path, "home", return_value=self.root), patch.object(cleanup, "open_process_paths", return_value=set()), patch.object(cleanup.os, "walk", side_effect=ordered_walk), patch.object(cleanup, "process_repository", side_effect=remove_fixture), contextlib.redirect_stdout(output):
+            result = cleanup.main()
+        self.assertEqual(result, 0)
+        rows = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertNotIn("discovery-error", [row["status"] for row in rows])
 
     def test_discovery_ignores_package_cache_without_hiding_worktrees(self):
         cache = self.root / ".cache/uv/package"
@@ -130,7 +276,7 @@ class WorktreeCleanupTest(unittest.TestCase):
         self.assertEqual(cleanup.expected_account(self.repository, [(self.root, "personal"), (self.repository, "work")]), "work")
 
     def test_remote_url_credentials_and_non_github_are_rejected(self):
-        for remote in ("https://token@github.com/owner/repository.git", "https://example.invalid/owner/repository.git"):
+        for remote in ("https://利用者@github.com/owner/repository.git", "https://example.invalid/owner/repository.git"):
             with patch.object(cleanup, "git", return_value=remote.encode()):
                 with self.assertRaisesRegex(cleanup.Blocked, "unsupported-origin"):
                     cleanup.github_repository(self.repository)
@@ -164,6 +310,21 @@ class WorktreeCleanupTest(unittest.TestCase):
         with patch.object(cleanup.subprocess, "run", side_effect=error):
             with self.assertRaisesRegex(cleanup.Blocked, "^direnv-failed$"):
                 cleanup.command(["direnv"])
+
+    def test_installer_rejects_missing_commands(self):
+        with patch.object(cleanup.Path, "home", return_value=self.root), patch.object(cleanup.shutil, "which", return_value=None), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(cleanup.Blocked, "missing-required-tool"):
+                cleanup.install_launch_agent(self.root / "config.json", False)
+        self.assertFalse((self.root / "Library/LaunchAgents/local.worktree-cleanup.plist").exists())
+
+    def test_installer_records_absolute_command_paths(self):
+        with patch.object(cleanup.Path, "home", return_value=self.root), patch.object(cleanup.shutil, "which", side_effect=lambda name: f"commands/{name}"), contextlib.redirect_stdout(io.StringIO()):
+            cleanup.install_launch_agent(self.root / "config.json", False)
+        agent = plistlib.loads((self.root / "Library/LaunchAgents/local.worktree-cleanup.plist").read_bytes())
+        self.assertTrue(all(Path(value).is_absolute() for value in agent["EnvironmentVariables"]["PATH"].split(":")))
+        self.assertEqual(agent["StartCalendarInterval"], {"Hour": 10, "Minute": 15})
+        self.assertFalse(agent["RunAtLoad"])
+        self.assertNotIn("--apply", agent["ProgramArguments"])
 
 
 if __name__ == "__main__":
