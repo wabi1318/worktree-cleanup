@@ -112,6 +112,8 @@ class WorktreeCleanupTest(unittest.TestCase):
         names = (
             ("日本語の作業", rb"\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e\xe3\x81\xae\xe4\xbd\x9c\xe6\xa5\xad"),
             (r"path\x41", rb"path\\x41"),
+            ("white\tspace\nname", rb"white\tspace\nname"),
+            ("literal^A", rb"literal^A"),
         )
         for name, encoded_name in names:
             with self.subTest(name=name):
@@ -120,7 +122,24 @@ class WorktreeCleanupTest(unittest.TestCase):
                 output = b"p0\0n" + os.fsencode(self.root) + b"/" + encoded_name + b"\0"
                 with patch.object(cleanup, "command", return_value=output):
                     process_paths = cleanup.open_process_paths()
-                self.assertEqual(process_paths, {directory})
+                self.assertIn(directory, process_paths)
+
+    def test_unescaped_backslash_process_path_is_preserved(self):
+        for name in (r"file\x41", r"file\x00"):
+            with self.subTest(name=name):
+                directory = self.root / name
+                directory.mkdir()
+                output = b"p0\0n" + os.fsencode(directory) + b"\0"
+                with patch.object(cleanup, "command", return_value=output):
+                    process_paths = cleanup.open_process_paths()
+                self.assertIn(directory, process_paths)
+
+    def test_worktree_with_ambiguous_lsof_path_is_kept(self):
+        worktree = self.root / "control\x01name"
+        self.git("worktree", "move", str(self.worktree), str(worktree))
+        self.entry = cleanup.list_worktrees(self.repository)[1]
+        self.assertEqual(self.reason(), "ambiguous-worktree-path")
+        self.assertTrue(worktree.exists())
 
     def test_case_variant_process_path_protects_worktree(self):
         process_path = Path(str(self.worktree / "README.md").swapcase())

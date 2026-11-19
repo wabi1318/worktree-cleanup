@@ -6,7 +6,7 @@ GitHubのPRがマージされた後、不要になったローカルのGit workt
 
 ## 動作環境
 
-- macOS、Python 3.9以降、Git、GitHub CLI（`gh`）、direnv、`lsof`
+- macOS、Python 3.9以降、Git 2.36以降、GitHub CLI（`gh`）、direnv、`lsof`
 - 各リポジトリのdirenv環境で、GitHub CLIの認証が済んでいること
 - `origin`がSSHまたはHTTPSのGitHub.comリポジトリを指していること。フォークの場合は、フォーク元のリポジトリも確認します。
 
@@ -51,7 +51,7 @@ python3 scripts/worktree-cleanup.py
 - 追跡対象ファイルの変更、ステージ済みの変更、未追跡ファイルがないこと。
 - Gitで変更の確認を省く設定（`assume-unchanged`／`skip-worktree`）が付いたファイルがないこと。
 - Gitの無視対象ファイルが残っていないこと。ただし、再取得できる依存関係として扱う`node_modules`内のファイルは例外です。
-- 現在のユーザーのプロセスが、その配下のファイルや作業ディレクトリを使用中であると`lsof`で検出されないこと。文字の大小や濁点の表記だけが違う場合も、使用中として保持します。
+- 現在のユーザーのプロセスが、その配下のファイルや作業ディレクトリを使用中であると`lsof`で検出されないこと。文字の大小や濁点の表記だけが違う場合も、使用中として保持します。`lsof`の出力で通常の文字と区別できない制御文字をパスに含む場合も保持します。
 - リポジトリ独自の外部変換処理（Gitの`clean`／`process`フィルター）が設定されていないこと。
 - ロック中、ディレクトリが存在しない状態、Gitの登録情報の整理対象（`prunable`）、シンボリックリンク、ブランチを選択していない状態（detached HEAD）のいずれでもないこと。また、ブランチが`main`、`master`、`develop`、`staging`、`production`、`trunk`のいずれでもないこと。
 - サブモジュールがなく、マージ、rebase、cherry-pick、revertなどの処理途中や、インデックスのロック状態が残っていないこと。

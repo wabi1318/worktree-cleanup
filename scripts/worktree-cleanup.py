@@ -6,7 +6,6 @@ Usage: python3 scripts/worktree-cleanup.py [--apply] [--install]
 """
 
 import argparse
-import codecs
 import fcntl
 import json
 import os
@@ -33,6 +32,8 @@ SCAN_EXCLUSIONS = {
 SHARED_BRANCHES = {"main", "master", "develop", "staging", "production", "trunk"}
 CONFIG_PATH = Path.home() / ".config/worktree-cleanup.json"
 PR_FIELDS = ".[] | {state, merged_at, html_url, head: {ref: .head.ref, sha: .head.sha, repo: .head.repo.full_name}} | @json"
+LSOF_PATH_ESCAPES = {b"b": b"\b", b"f": b"\f", b"n": b"\n", b"r": b"\r", b"t": b"\t", b"\\": b"\\"}
+LSOF_CARET_CONTROLS = re.compile(r"[\x01-\x07\x0b\x0e-\x1f]")
 
 
 class Blocked(Exception):
@@ -127,6 +128,16 @@ def discover_repositories(roots):
             ]
 
 
+def decode_lsof_path(value):
+    def unescape(match):
+        hex_value = match.group(1)
+        if hex_value is not None:
+            return bytes.fromhex(hex_value.decode("ascii"))
+        return LSOF_PATH_ESCAPES[match.group(2)]
+
+    return os.fsdecode(re.sub(rb"\\(?:x([0-9a-fA-F]{2})|([bfnrt\\]))", unescape, value))
+
+
 def open_process_paths():
     output = command(["lsof", "-nP", "-u", str(os.getuid()), "-F0pn"])
     paths = set()
@@ -136,9 +147,12 @@ def open_process_paths():
         if field.startswith(b"p"):
             process_id = int(field[1:])
         elif field.startswith(b"n/") and process_id != os.getpid():
-            # 日本語や改行が別の表記で出力されても、使用中のファイルを見落とさないようにする。
-            raw_path = codecs.escape_decode(field[1:])[0]
-            paths.add(Path(os.fsdecode(raw_path)).resolve())
+            # 逆斜線が文字のままでも、別のパスとして扱って作業中の場所を見落とさない。
+            original = os.fsdecode(field[1:])
+            decoded = decode_lsof_path(field[1:])
+            paths.add(Path(original).resolve())
+            if decoded != original and "\0" not in decoded:
+                paths.add(Path(decoded).resolve())
     return paths
 
 
@@ -148,7 +162,11 @@ def local_block_reason(repository, worktree, process_paths):
         return "locked-or-prunable"
     if not path.is_dir() or path.is_symlink():
         return "missing-or-symlink"
-    comparison_path = normalize_path_for_comparison(path.resolve())
+    resolved_path = path.resolve()
+    # lsofでは制御文字と「^A」のような名前を区別できない。
+    if LSOF_CARET_CONTROLS.search(str(resolved_path)):
+        return "ambiguous-worktree-path"
+    comparison_path = normalize_path_for_comparison(resolved_path)
     branch = worktree["branch"]
     if not branch.startswith("refs/heads/") or branch.removeprefix("refs/heads/") in SHARED_BRANCHES:
         return "detached-or-shared-branch"
