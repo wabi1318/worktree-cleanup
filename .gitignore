@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+docs/work-log/
+worktree-cleanup.json
+*.jsonl
